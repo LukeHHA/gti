@@ -53,6 +53,20 @@ int membershipRank(ProjectPackageMembership membership) {
   return 0;
 }
 
+
+bool pathIsWithin(const std::filesystem::path &root,
+                  const std::filesystem::path &candidate) {
+  auto rootPart = root.begin();
+  auto candidatePart = candidate.begin();
+  for (; rootPart != root.end() && candidatePart != candidate.end();
+       ++rootPart, ++candidatePart) {
+    if (*rootPart != *candidatePart) {
+      return false;
+    }
+  }
+  return rootPart == root.end();
+}
+
 } // namespace
 
 std::string ResolvedProjectPackage::identity() const {
