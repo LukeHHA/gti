@@ -1420,6 +1420,365 @@ int main() {
 
 } // namespace
 
+
+// The inline closure chain: lambda-typed places and values never declare
+// (C++ closure types are unnameable), so the Closure compute fuses into
+// its consuming invocations, which spell the full literal with capture
+// names from the Capture rows and the recursively emitted verified body.
+// Checked arithmetic inside the literal keeps the compatibility terminal
+// helper spelling, so the lambda's failure edges are unreachable in text.
+void testInlineClosureChainEmission() {
+  const lang::FrontendResult frontend =
+      analyze("cpp-mir-closure-chain.gti", R"(
+int main() {
+  int offset = 3;
+  auto add_offset = [offset](int value) -> int {
+    return offset + value;
+  };
+  auto copied = add_offset;
+  int doubled = [](int value) -> int {
+    return value * 2;
+  }(4);
+  return copied(doubled) - 11;
+}
+)");
+  expect(frontend.canGenerateCode(),
+         "the closure-chain fixture should pass the frontend");
+  if (!frontend.canGenerateCode()) {
+    return;
+  }
+  const auto entry =
+      std::find_if(frontend.mir.functionInstances().begin(),
+                   frontend.mir.functionInstances().end(),
+                   [](const lang::MirFunctionInstance &function) {
+                     return function.entryKind != lang::ProgramEntryKind::None;
+                   });
+  expect(entry != frontend.mir.functionInstances().end(),
+         "the closure-chain fixture should retain its entry instance");
+  if (entry == frontend.mir.functionInstances().end()) {
+    return;
+  }
+  const lang::CppMirBodyEmissionMap map(lang::buildCppMirBodyEmissionMapRows(
+      frontend.semantics, frontend.mir, lang::CppStandard::Cpp23));
+  const lang::CppMirBodyEmitter emitter(frontend.mir, map);
+  const lang::MirBodyAddress address{.kind = lang::MirBodyKind::Function,
+                                     .owner = entry->id};
+  expect(emitter.analyze(address).ready(),
+         "the closure-chain entry should be analysis-Ready under production "
+         "rows");
+  expect(emitter.supportsFailureBodyText(address),
+         "the closure-chain entry should prove its failure-form text");
+  for (const lang::MirLambdaInstance &lambda :
+       frontend.mir.lambdaInstances()) {
+    expect(emitter.supportsBodyText({.kind = lang::MirBodyKind::Lambda,
+                                     .owner = lambda.id}),
+           "each lambda body should prove its plain-shape nested text");
+  }
+  const lang::CppMirBodyEmissionText text =
+      emitter.emitFailureBodyText(address, "closure-test-v0", 1);
+  const auto contains = [&](std::string_view needle) {
+    return text.text.find(needle) != std::string::npos;
+  };
+  expect(contains("// GTI verified-MIR body: closure-test-v0 "
+                  "lambda-instance 1") &&
+             contains("// GTI verified-MIR body: closure-test-v0 "
+                      "lambda-instance 2"),
+         "both lambda bodies should emit nested banners inside the entry");
+  expect(contains("[offset = __gti_mir_p_"),
+         "the capture should spell its Capture row name over the enclosing "
+         "place expression");
+  expect(contains("::gti_internal::backend::add(") &&
+             contains("::gti_internal::backend::multiply("),
+         "checked arithmetic inside the literals should keep the "
+         "compatibility terminal helper spelling");
+  expect(!contains("mir_checked_multiply_v1") &&
+             !contains("mir_checked_add_v1"),
+         "the literal interiors must not adopt the transformed checked "
+         "helpers");
+  expect(contains("rejoins the fused closure chain") &&
+             contains("joins the fused chain") &&
+             contains("spells at its consuming invocation"),
+         "the fused chain instructions should spell as comments only");
+}
+
+// Fusing the literal to a later invocation is sound only while every
+// captured place stays frozen after the Closure; a capture rewritten
+// between creation and invocation must decline fail-closed.
+void testClosureCaptureFreezeDeclines() {
+  const lang::FrontendResult frontend =
+      analyze("cpp-mir-closure-freeze.gti", R"(
+int main() {
+  mut int x = 1;
+  auto f = [x](int value) -> int {
+    return x + value;
+  };
+  x = 2;
+  return f(0) - 1;
+}
+)");
+  expect(frontend.canGenerateCode(),
+         "the capture-freeze fixture should pass the frontend");
+  if (!frontend.canGenerateCode()) {
+    return;
+  }
+  const auto entry =
+      std::find_if(frontend.mir.functionInstances().begin(),
+                   frontend.mir.functionInstances().end(),
+                   [](const lang::MirFunctionInstance &function) {
+                     return function.entryKind != lang::ProgramEntryKind::None;
+                   });
+  expect(entry != frontend.mir.functionInstances().end(),
+         "the capture-freeze fixture should retain its entry instance");
+  if (entry == frontend.mir.functionInstances().end()) {
+    return;
+  }
+  const lang::CppMirBodyEmissionMap map(lang::buildCppMirBodyEmissionMapRows(
+      frontend.semantics, frontend.mir, lang::CppStandard::Cpp23));
+  const lang::CppMirBodyEmitter emitter(frontend.mir, map);
+  const lang::MirBodyAddress address{.kind = lang::MirBodyKind::Function,
+                                     .owner = entry->id};
+  expect(!emitter.supportsBodyText(address) &&
+             !emitter.supportsFailureBodyText(address),
+         "a capture rewritten after the Closure must keep the body outside "
+         "the fused-chain vocabulary");
+}
+
+
+// The deduced-callable template vocabulary (task: CallableDispatch): a
+// Function body with callable parameters keeps the compatibility plain
+// shape — its callable parameter place declares only under a template
+// emission's overlay type row spelling the template parameter name, the
+// invocation stages that place directly with no intermediate copy, and
+// its invoke edge is a plain goto because every reachable failure
+// convention is terminally contained. Without the overlay row the body
+// stays outside the vocabulary, so production emission is unchanged
+// until the declaration-level selector lands.
+void testCallableTemplateBodyVocabulary() {
+  const lang::FrontendResult frontend =
+      analyze("cpp-mir-callable-template.gti", R"(
+void invoke<Operation>(Operation operation) {
+  operation(42);
+}
+
+int main() {
+  auto report = [](int value) -> void {
+    if (value == 42) {
+      return;
+    }
+  };
+  invoke(report);
+  return 0;
+}
+)");
+  expect(frontend.canGenerateCode(),
+         "the callable-template fixture should pass the frontend");
+  if (!frontend.canGenerateCode()) {
+    return;
+  }
+  const lang::MirFunctionInstance *invoke = nullptr;
+  for (const lang::MirFunctionInstance &function :
+       frontend.mir.functionInstances()) {
+    if (!function.callableParameters.empty()) {
+      invoke = &function;
+    }
+  }
+  expect(invoke != nullptr && !invoke->parameterTypes.empty(),
+         "the fixture should lower the callable-parameter instance");
+  if (invoke == nullptr || invoke->parameterTypes.empty()) {
+    return;
+  }
+  const lang::MirBodyAddress address{.kind = lang::MirBodyKind::Function,
+                                     .owner = invoke->id};
+  lang::CppMirBodyEmissionMapRows production =
+      lang::buildCppMirBodyEmissionMapRows(frontend.semantics, frontend.mir,
+                                           lang::CppStandard::Cpp23);
+  {
+    lang::CppMirBodyEmissionMapRows copy = production;
+    const lang::CppMirBodyEmissionMap withoutOverlay{std::move(copy)};
+    const lang::CppMirBodyEmitter emitter(frontend.mir, withoutOverlay);
+    expect(!emitter.supportsBodyText(address) &&
+               !emitter.supportsFailureBodyText(address),
+           "without the overlay row the callable-template body must stay "
+           "outside the vocabulary");
+  }
+  const std::optional<lang::CppMirTypeRepresentationKind> callableKind =
+      lang::cppMirExpectedTypeRepresentation(invoke->parameterTypes.front());
+  expect(callableKind.has_value(),
+         "the callable type should classify for representation");
+  if (!callableKind) {
+    return;
+  }
+  production.types.push_back({.type = invoke->parameterTypes.front(),
+                              .kind = *callableKind,
+                              .spelling = "Operation"});
+  const lang::CppMirBodyEmissionMap map(std::move(production));
+  const lang::CppMirBodyEmitter emitter(frontend.mir, map);
+  expect(emitter.supportsBodyText(address),
+         "under the overlay row the callable-template body should prove "
+         "its plain-shape text");
+  if (!emitter.supportsBodyText(address)) {
+    return;
+  }
+  const lang::CppMirBodyEmissionText text =
+      emitter.emitBodyText(address, "callable-template-test-v0", 1);
+  const auto contains = [&](std::string_view needle) {
+    return text.text.find(needle) != std::string::npos;
+  };
+  expect(contains("Operation __gti_mir_p_1 = __gti_mir_arg_0;"),
+         "the callable parameter local should declare with the template "
+         "parameter spelling");
+  expect(contains("__gti_mir_p_1(__gti_mir_v_"),
+         "the invocation should stage the callable parameter place "
+         "directly");
+  expect(contains("std::abort();"),
+         "the unreachable propagate block should spell abort");
+  expect(!contains("__gti_mir_failure_record"),
+         "the plain shape must not adopt the transformed record ABI");
+}
+
+
+// The declaration-level template route end to end: every monomorphized
+// instance of a deduced-callable template proves byte-identical text
+// under its own overlay row, and the production artifact carries exactly
+// one template definition holding one banner per covered instance, with
+// callers passing fused literals by deduction.
+void testDeducedCallableTemplateEmission() {
+  const lang::FrontendResult frontend =
+      analyze("cpp-mir-deduced-template.gti", R"(
+void apply<Operation>(Operation operation) {
+  operation(1);
+}
+
+int main() {
+  auto first = [](int value) -> void {
+    if (value == 1) {
+      return;
+    }
+  };
+  auto second = [](int value) -> void {
+    if (value == 2) {
+      return;
+    }
+  };
+  apply(first);
+  apply(second);
+  return 0;
+}
+)");
+  expect(frontend.canGenerateCode(),
+         "the deduced-template fixture should pass the frontend");
+  if (!frontend.canGenerateCode()) {
+    return;
+  }
+  const lang::OptimizationResult optimizations =
+      lang::OptimizationPipeline().run(frontend.hir,
+                                       lang::OptimizationLevel::O0);
+  const lang::BackendArtifact artifact =
+      lang::CppBackend().generate({.program = frontend.program,
+                                   .semantics = frontend.semantics,
+                                   .hir = frontend.hir,
+                                   .mir = frontend.mir,
+                                   .sourceMir = &frontend.mir,
+                                   .optimizations = optimizations});
+  const std::string &text = artifact.contents;
+  const auto count = [&](std::string_view needle) {
+    std::size_t occurrences = 0;
+    for (std::size_t at = text.find(needle); at != std::string::npos;
+         at = text.find(needle, at + needle.size())) {
+      ++occurrences;
+    }
+    return occurrences;
+  };
+  expect(count("(Operation __gti_mir_arg_0) {") == 1,
+         "exactly one template definition should carry the MIR body");
+  expect(count("deduced-callable-v1 function-instance") == 2,
+         "the single template body should carry one banner per covered "
+         "instance");
+  expect(count("// GTI verified-MIR body: scalar-cfg-failure-v1 "
+               "lambda-instance") == 2,
+         "both fused literals should embed their verified lambda bodies at "
+         "the call sites");
+}
+
+
+// The reference-return failure ABI (ADR 018 §5): a may-raise body whose
+// return is a loan publishes its pointer through a `T **` out-parameter,
+// the Return-with-loan spells the publication, and the whole artifact —
+// transformed member, boundary wrapper, and MIR-emitted caller — carries
+// the convention end to end.
+void testReferenceReturnFailureAbi() {
+  const lang::FrontendResult frontend =
+      analyze("cpp-mir-reference-return.gti", R"(
+class tally {
+  mut int total;
+
+public:
+  tally(int start) : total(start) {}
+
+  mut int& bump(int amount) mut {
+    this.total += amount;
+    return this.total;
+  }
+};
+
+int main() {
+  mut tally counter = tally(3);
+  mut int& first = counter.bump(4);
+  first = 17;
+  return counter.bump(0) - 17;
+}
+)");
+  expect(frontend.canGenerateCode(),
+         "the reference-return fixture should pass the frontend");
+  if (!frontend.canGenerateCode()) {
+    return;
+  }
+  const lang::MirFunctionInstance *bump = nullptr;
+  for (const lang::MirFunctionInstance &function :
+       frontend.mir.functionInstances()) {
+    if (function.returnType.kind == lang::SemanticType::Reference &&
+        function.mayRaiseDefinedFailure) {
+      bump = &function;
+    }
+  }
+  expect(bump != nullptr,
+         "the fixture should lower the loan-returning may-raise member");
+  if (bump == nullptr) {
+    return;
+  }
+  const lang::CppMirBodyEmissionMap map(lang::buildCppMirBodyEmissionMapRows(
+      frontend.semantics, frontend.mir, lang::CppStandard::Cpp23));
+  const lang::CppMirBodyEmitter emitter(frontend.mir, map);
+  const lang::MirBodyAddress address{.kind = lang::MirBodyKind::Function,
+                                     .owner = bump->id};
+  expect(emitter.supportsFailureBodyText(address),
+         "the loan-returning body should prove its transformed text");
+  if (!emitter.supportsFailureBodyText(address)) {
+    return;
+  }
+  const lang::OptimizationResult optimizations =
+      lang::OptimizationPipeline().run(frontend.hir,
+                                       lang::OptimizationLevel::O0);
+  const lang::BackendArtifact artifact =
+      lang::CppBackend().generate({.program = frontend.program,
+                                   .semantics = frontend.semantics,
+                                   .hir = frontend.hir,
+                                   .mir = frontend.mir,
+                                   .sourceMir = &frontend.mir,
+                                   .optimizations = optimizations});
+  const std::string &text = artifact.contents;
+  const auto contains = [&](std::string_view needle) {
+    return text.find(needle) != std::string::npos;
+  };
+  expect(contains("std::int32_t **__gti_mir_out_result"),
+         "the transformed signature should carry the pointer out-parameter");
+  expect(contains("*__gti_mir_out_result = __gti_mir_loan_"),
+         "the Return-with-loan should publish through the out-parameter");
+  expect(contains("std::int32_t *__gti_mir_boundary_result{};") &&
+             contains("return *__gti_mir_boundary_result;"),
+         "the boundary wrapper should dereference the published pointer");
+}
+
 int main() {
   testExhaustiveEnumClassification();
   testReadyBodyAndRepresentationFailures();
@@ -1434,6 +1793,11 @@ int main() {
   testCleanupFixtureFunctionBodiesAreReady();
   testOwnedLifecycleConstructionBodiesReady();
   testDischargedStorageReadAnalysis();
+  testInlineClosureChainEmission();
+  testClosureCaptureFreezeDeclines();
+  testCallableTemplateBodyVocabulary();
+  testDeducedCallableTemplateEmission();
+  testReferenceReturnFailureAbi();
 
   if (failures != 0) {
     std::cerr << failures << " cpp MIR body-emitter test(s) failed\n";

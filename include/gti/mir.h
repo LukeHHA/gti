@@ -325,18 +325,24 @@ enum class MirLiteralProvenanceKind {
   None,
   Source,
   IdentityFold,
+  ComputeFold,
   Count,
 };
 
 // Every MIR Compute/Literal instruction says whether it came directly from
 // lowering or from a verified optimizer rewrite. A rewrite retains its
 // original MIR input rather than asking a backend to recover transformation
-// authority from HIR. The source value is proof-only metadata: it must
-// dominate the rewritten instruction and trace through same-typed identities
-// to the exact literal.
+// authority from HIR. The provenance is proof-only metadata. An identity
+// fold traces its dominating source value through same-typed identities to
+// the exact literal. A compute fold retains the folded operation and its
+// exact operand values, each of which must dominate the rewritten
+// instruction and carry a literal the operation re-evaluates to this
+// instruction's literal.
 struct MirLiteralProvenance {
   MirLiteralProvenanceKind kind = MirLiteralProvenanceKind::None;
   MirValueId sourceValue = 0;
+  MirOperation sourceOperation = MirOperation::Literal;
+  std::vector<MirValueId> sourceValues;
 
   friend bool operator==(const MirLiteralProvenance &,
                          const MirLiteralProvenance &) = default;
@@ -441,6 +447,25 @@ struct MirSwitchTarget {
                          const MirSwitchTarget &) = default;
 };
 
+enum class MirTerminatorProvenanceKind {
+  None,
+  BranchFold,
+  Count,
+};
+
+// A rewritten terminator retains replayable proof exactly like a rewritten
+// literal. A branch fold keeps the folded branch's condition value: the
+// verifier re-reads that value's dominating literal and re-selects the
+// taken target, so a Goto produced by the optimizer can never disagree
+// with the branch it replaced.
+struct MirTerminatorProvenance {
+  MirTerminatorProvenanceKind kind = MirTerminatorProvenanceKind::None;
+  MirValueId foldSourceValue = 0;
+
+  friend bool operator==(const MirTerminatorProvenance &,
+                         const MirTerminatorProvenance &) = default;
+};
+
 struct MirTerminator {
   MirTerminatorKind kind = MirTerminatorKind::None;
   MirHostedStartupOperationId hostedStartupOperation = 0;
@@ -454,6 +479,7 @@ struct MirTerminator {
   MirBlockId elseTarget = 0;
   std::vector<MirSwitchTarget> switchTargets;
   std::vector<MirLifecycleEvent> successLifecycle;
+  MirTerminatorProvenance provenance;
 
   friend bool operator==(const MirTerminator &,
                          const MirTerminator &) = default;
@@ -779,6 +805,7 @@ struct MirLambdaInstance {
   SemanticType type = SemanticType::Unknown;
   SemanticType returnType = SemanticType::Unknown;
   std::vector<SemanticType> parameterTypes;
+  std::vector<HirBindingId> parameterBindings;
   std::vector<SemanticType> captureTypes;
   std::vector<LambdaCaptureMode> captureModes;
   std::vector<SymbolId> captureSymbols;
@@ -1069,6 +1096,23 @@ enumerateMirBodyAddresses(const MirProgram &program);
 [[nodiscard]] MirBody *findMirBody(MirProgram &program, MirBodyAddress address);
 
 [[nodiscard]] MirVerificationResult verifyMirProgram(const MirProgram &program);
+
+// One literal operand of a compute fold, carried with the type that fixes
+// its evaluation domain.
+struct MirComputeFoldOperand {
+  Literal literal;
+  SemanticType type;
+};
+
+// The single evaluation authority for MIR compute folds: the optimizer
+// derives a fold through it and the verifier replays the same call, so a
+// folded literal can never disagree with its proof. Returns nothing for
+// any operation, operand shape, or domain outside the folded vocabulary
+// (currently the boolean-producing comparisons and logical not).
+[[nodiscard]] std::optional<Literal>
+evaluateMirComputeFold(MirOperation operation,
+                       const std::vector<MirComputeFoldOperand> &operands,
+                       const SemanticType &resultType);
 
 // Verifies that `optimized` is exactly `source` plus rewrites admitted by the
 // controlled MIR editor. The current rewrite vocabulary contains only the

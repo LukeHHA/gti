@@ -1496,6 +1496,13 @@ struct RowsBuilder {
     if (type == SemanticType::Unknown) {
       return;
     }
+    // A C++ closure type is unnameable: any row for a Lambda-kind type
+    // would carry a forged spelling. The closure-chain and template
+    // vocabularies own these types row-free (a template emission injects
+    // its own overlay row spelling the template parameter name).
+    if (type.kind == SemanticType::Lambda) {
+      return;
+    }
     const std::optional<CppMirTypeRepresentationKind> kind =
         cppMirExpectedTypeRepresentation(type);
     if (kind && std::none_of(rows.types.begin(), rows.types.end(),
@@ -1658,6 +1665,44 @@ buildCppMirBodyEmissionMapRows(const SemanticModel &semantics,
                      "::~" + info->declaration->name().lexeme});
   }
 
+  // Capture name rows: each lambda instance's captures spell exactly the
+  // source capture names the compatibility literal prints, matched from
+  // the semantic capture list by binding symbol.
+  for (const MirLambdaInstance &lambda : mir.lambdaInstances()) {
+    const LambdaInfo *info = semantics.findLambda(lambda.declaration);
+    if (info == nullptr) {
+      continue;
+    }
+    for (std::size_t index = 0; index < lambda.captureSymbols.size(); ++index) {
+      const SymbolId symbol = lambda.captureSymbols[index];
+      if (symbol == 0 || index >= lambda.captureTypes.size()) {
+        continue;
+      }
+      for (const LambdaCaptureInfo &capture : info->captures) {
+        if (capture.bindingSymbol == symbol &&
+            !capture.capture.lexeme.empty()) {
+          builder.rows.symbols.push_back(
+              {.kind = CppMirSymbolRepresentationKind::Capture,
+               .owner = lambda.id,
+               .symbol = symbol,
+               .ordinal = index + 1,
+               .type = lambda.captureTypes[index],
+               .spelling = capture.capture.lexeme});
+          break;
+        }
+      }
+    }
+  }
+
+  // A verified no-argument hosted-startup body's emitted name is the
+  // program entry adapter itself.
+  if (cppMirHostedStartupNoArgumentsSchedule(mir) && mir.hostedStartupPlan()) {
+    builder.rows.bodies.push_back(
+        {.address = {.kind = MirBodyKind::HostedStartup,
+                     .owner = mir.hostedStartupPlan()->entry},
+         .spelling = "::main"});
+  }
+
   // The executable module body carries its own name row like every other
   // executable body; it is never a call target.
   if (!mir.programInitializationPlan().steps.empty()) {
@@ -1708,6 +1753,42 @@ buildCppMirBodyEmissionMapRows(const SemanticModel &semantics,
   builder.rows.capabilities.push_back(
       {.kind = CppMirEmissionCapabilityKind::Intrinsic,
        .spelling = "gti_internal_backend_helpers_v1"});
+  // HostedEntry names the shipped program-entry adapter: every hosted
+  // artifact carries the generated main() that marshals arguments,
+  // forwards the entry call, and routes defined failure through the
+  // terminal containment contract. The entry function's own body is
+  // ordinary; this row is what its analysis demand resolves against.
+  builder.rows.capabilities.push_back(
+      {.kind = CppMirEmissionCapabilityKind::HostedEntry,
+       .spelling = "gti_hosted_entry_adapter_v1"});
+  // Expected names the artifact's shipped expected representation. The
+  // row's spelling is the exact error-construction call the compatibility
+  // path emits for the selected standard — std::unexpected under C++23,
+  // the vendored expected-lite constructor under C++20 — so Unexpected
+  // text is copied from this row and can never drift by standard.
+  builder.rows.capabilities.push_back(
+      {.kind = CppMirEmissionCapabilityKind::Expected,
+       .spelling = standard == CppStandard::Cpp23
+                       ? "std::unexpected"
+                       : "::nonstd::make_unexpected"});
+  // Closure names the inline C++ lambda literal representation: a Closure
+  // compute spells `[name = <place>, ...](<params>) -> <ret> { <verified
+  // body> }` with capture names copied from the lambda's Capture rows,
+  // exactly like the compatibility path's inline lambda emission. C++
+  // closure types are unnameable, so the chain fuses into its consuming
+  // invocations and nothing here is ever a spelled type or call target.
+  builder.rows.capabilities.push_back(
+      {.kind = CppMirEmissionCapabilityKind::Closure,
+       .spelling = "cpp_inline_lambda_v1"});
+  // CallableDispatch names the deduction-based callable representation:
+  // a callable value invokes as `<literal>(<args>)` and a callable-typed
+  // argument passes by template-argument deduction, never through a
+  // spelled closure type name. The text vocabulary still declines every
+  // callable shape it cannot fuse, so the row moves analysis honesty,
+  // not emission.
+  builder.rows.capabilities.push_back(
+      {.kind = CppMirEmissionCapabilityKind::CallableDispatch,
+       .spelling = "cpp_deduced_callable_v1"});
 
   // Executable per-instance field-initializer bodies carry their own name
   // row like every other executable body; the spelling is the owner scope
@@ -1731,6 +1812,12 @@ buildCppMirBodyEmissionMapRows(const SemanticModel &semantics,
              "::__gti_field_initializers"});
   }
   for (const MirLambdaInstance &lambda : mir.lambdaInstances()) {
+    // A lambda body is never a call target: it spells only nested inside
+    // its closure literal. The row exists so a Closure site can prove the
+    // exact body target is representable before fusing it.
+    builder.rows.bodies.push_back(
+        {.address = {.kind = MirBodyKind::Lambda, .owner = lambda.id},
+         .spelling = "__gti_inline_lambda_" + std::to_string(lambda.id)});
     builder.addType(lambda.type);
     builder.addType(lambda.returnType);
     for (const SemanticType &type : lambda.parameterTypes) {
@@ -1825,6 +1912,21 @@ buildCppMirBodyEmissionMapRows(const SemanticModel &semantics,
       spelling += "::";
     } else if (!info->declaration->hasCLinkage() &&
                !info->declaration->runtimeBinding()) {
+      spelling = "::__gti_program";
+      for (std::size_t index = 0; index < info->namespaceScope.size();
+           ++index) {
+        const std::string &scope = info->namespaceScope[index];
+        spelling += "::";
+        spelling += index == 0 && scope == "std"
+                        ? std::string(cppEmittedStandardNamespace)
+                        : scope;
+      }
+      spelling += "::";
+    } else if (!info->namespaceScope.empty()) {
+      // A C-linkage or runtime-binding declaration keeps its exact
+      // external symbol, but extern "C" affects linkage, not C++ name
+      // lookup: when the emitted declaration lives inside a namespace,
+      // the call-target spelling must name that namespace.
       spelling = "::__gti_program";
       for (std::size_t index = 0; index < info->namespaceScope.size();
            ++index) {

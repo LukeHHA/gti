@@ -61,11 +61,32 @@ void MirProgramEditor::queueLiteralReplacement(
                      .literal = std::move(literal)});
 }
 
+void MirProgramEditor::queueComputeFoldReplacement(
+    MirInstructionAddress address, MirInstructionId expectedInstruction,
+    MirOperation expectedOperation, Literal literal) {
+  patches.push_back({.address = address,
+                     .expectedInstruction = expectedInstruction,
+                     .expectedOperation = expectedOperation,
+                     .literal = std::move(literal),
+                     .computeFold = true});
+}
+
+void MirProgramEditor::queueBranchFold(MirBodyAddress body, MirBlockId block,
+                                       MirValueId expectedCondition,
+                                       bool taken) {
+  branchFolds.push_back({.body = body,
+                         .block = block,
+                         .expectedCondition = expectedCondition,
+                         .taken = taken});
+}
+
 MirEditResult MirProgramEditor::apply() {
   MirEditResult result;
   std::vector<LiteralReplacement> queued = std::move(patches);
   patches.clear();
-  if (queued.empty()) {
+  std::vector<BranchFold> queuedBranchFolds = std::move(branchFolds);
+  branchFolds.clear();
+  if (queued.empty() && queuedBranchFolds.empty()) {
     return result;
   }
 
@@ -108,10 +129,25 @@ MirEditResult MirProgramEditor::apply() {
                "MIR replacement target is not the expected computation");
       continue;
     }
-    if (patch.expectedOperation != MirOperation::Identity ||
-        instruction.operands.size() != 1 ||
-        instruction.operands.front().kind != MirOperandKind::Value ||
-        instruction.operands.front().value == 0) {
+    if (patch.computeFold) {
+      const bool valueOperands =
+          !instruction.operands.empty() && instruction.operands.size() <= 2 &&
+          std::all_of(instruction.operands.begin(), instruction.operands.end(),
+                      [](const MirOperand &operand) {
+                        return operand.kind == MirOperandKind::Value &&
+                               operand.value != 0;
+                      });
+      if (patch.expectedOperation == MirOperation::Identity ||
+          patch.expectedOperation == MirOperation::Literal || !valueOperands) {
+        addError(result, patch.address, patch.expectedInstruction,
+                 "MIR compute-fold replacement is missing its exact value "
+                 "operands");
+        continue;
+      }
+    } else if (patch.expectedOperation != MirOperation::Identity ||
+               instruction.operands.size() != 1 ||
+               instruction.operands.front().kind != MirOperandKind::Value ||
+               instruction.operands.front().value == 0) {
       addError(result, patch.address, patch.expectedInstruction,
                "MIR literal replacement is missing its exact identity "
                "source");
@@ -132,25 +168,97 @@ MirEditResult MirProgramEditor::apply() {
     return result;
   }
 
+  for (const BranchFold &fold : queuedBranchFolds) {
+    const MirBody *target = findMirBody(program, fold.body);
+    const MirBlock *block =
+        target == nullptr ? nullptr : target->findBlock(fold.block);
+    if (block == nullptr ||
+        block->terminator.kind != MirTerminatorKind::Branch ||
+        !block->terminator.value ||
+        block->terminator.value->kind != MirOperandKind::Value ||
+        block->terminator.value->value != fold.expectedCondition ||
+        (fold.taken ? block->terminator.target
+                    : block->terminator.elseTarget) == 0) {
+      addError(result, {.body = fold.body, .block = fold.block}, 0,
+               "MIR branch fold target is not the expected literal branch");
+    }
+  }
+  if (!result.verification.valid()) {
+    return result;
+  }
+
   MirProgram candidate = program;
   std::vector<MirBodyAddress> touched;
   for (const LiteralReplacement &patch : queued) {
     MirBody *target = findMirBody(candidate, patch.address.body);
     MirInstruction &instruction = target->blocks[patch.address.block - 1]
                                       .instructions[patch.address.index];
-    const MirValueId sourceValue = instruction.operands.front().value;
     MirInstruction replacement = instruction;
+    if (patch.computeFold) {
+      MirLiteralProvenance provenance{.kind =
+                                          MirLiteralProvenanceKind::ComputeFold,
+                                      .sourceOperation = instruction.operation};
+      for (const MirOperand &operand : instruction.operands) {
+        provenance.sourceValues.push_back(operand.value);
+      }
+      replacement.literalProvenance = std::move(provenance);
+    } else {
+      replacement.literalProvenance = MirLiteralProvenance{
+          .kind = MirLiteralProvenanceKind::IdentityFold,
+          .sourceValue = instruction.operands.front().value};
+    }
     replacement.operation = MirOperation::Literal;
     replacement.operands.clear();
     replacement.literal = patch.literal;
-    replacement.literalProvenance =
-        MirLiteralProvenance{.kind = MirLiteralProvenanceKind::IdentityFold,
-                             .sourceValue = sourceValue};
     instruction = std::move(replacement);
     if (std::find(touched.begin(), touched.end(), patch.address.body) ==
         touched.end()) {
       touched.push_back(patch.address.body);
     }
+  }
+
+  for (const BranchFold &fold : queuedBranchFolds) {
+    MirBody *target = findMirBody(candidate, fold.body);
+    MirBlock *block = nullptr;
+    for (MirBlock &candidateBlock : target->blocks) {
+      if (candidateBlock.id == fold.block) {
+        block = &candidateBlock;
+      }
+    }
+    MirTerminator &terminator = block->terminator;
+    // The folded condition must be a literal bool in the candidate (the
+    // literal patches above may be what folded it) agreeing with the
+    // taken direction.
+    const bool *condition = nullptr;
+    for (const MirBlock &candidateBlock : target->blocks) {
+      for (const MirInstruction &instruction : candidateBlock.instructions) {
+        if (instruction.result &&
+            *instruction.result == fold.expectedCondition &&
+            instruction.kind == MirInstructionKind::Compute &&
+            instruction.operation == MirOperation::Literal &&
+            instruction.literal) {
+          condition = std::get_if<bool>(&*instruction.literal);
+        }
+      }
+    }
+    if (condition == nullptr || *condition != fold.taken) {
+      addError(result, {.body = fold.body, .block = fold.block}, 0,
+               "MIR branch fold condition is not the agreed literal");
+      continue;
+    }
+    terminator.kind = MirTerminatorKind::Goto;
+    terminator.target = fold.taken ? terminator.target : terminator.elseTarget;
+    terminator.elseTarget = 0;
+    terminator.value.reset();
+    terminator.provenance =
+        MirTerminatorProvenance{.kind = MirTerminatorProvenanceKind::BranchFold,
+                                .foldSourceValue = fold.expectedCondition};
+    if (std::find(touched.begin(), touched.end(), fold.body) == touched.end()) {
+      touched.push_back(fold.body);
+    }
+  }
+  if (!result.verification.valid()) {
+    return result;
   }
 
   for (MirBodyAddress address : touched) {
@@ -159,6 +267,7 @@ MirEditResult MirProgramEditor::apply() {
       addError(result, {.body = address}, 0,
                "MIR replacement produced invalid value uses");
     }
+    rebuildMirReachability(*target);
   }
   if (!result.verification.valid()) {
     return result;
@@ -171,10 +280,15 @@ MirEditResult MirProgramEditor::apply() {
 
   program = std::move(candidate);
   result.changed = true;
-  result.appliedPatches = queued.size();
+  result.appliedPatches = queued.size() + queuedBranchFolds.size();
   result.valueUsesRebuilt = true;
   result.invalidation.instructionFacts = true;
   result.invalidation.valueUses = true;
+  if (!queuedBranchFolds.empty()) {
+    result.invalidation.controlFlow = true;
+    result.invalidation.reachability = true;
+    result.invalidation.dominance = true;
+  }
   return result;
 }
 

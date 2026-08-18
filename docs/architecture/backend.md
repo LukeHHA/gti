@@ -296,6 +296,55 @@ generic emitter replaces that single whole-program route.
   record pointer forwarded unchanged, the paired `Invoke` branching on the
   bool — and admission is a greatest fixpoint over the transformed set, so
   a body whose may-raise callee cannot transform declines with it.
+  Closures join both forms as fused inline literals: a C++ closure type
+  is unnameable, so no lambda-typed place or value ever declares a local.
+  A `Closure` compute either feeds an invocation receiver directly or
+  initializes a dedicated single-write lambda local whose loads feed
+  further initializations or invocation receivers, and each consuming
+  invocation spells the complete literal — capture names copied from the
+  lambda's `Capture` rows over the enclosing body's place expressions,
+  positional parameters, and the recursively emitted verified lambda body
+  carrying its own banner marker. Fusing a literal to a later invocation
+  is sound because captured places are frozen: their only writes are
+  entry-block `Initialize`s preceding the `Closure`, nothing loans or
+  drops them, and the entry block is never re-entered; move captures
+  additionally collapse to exactly one direct same-block invocation.
+  Lambda bodies admit only in the plain success shape — the literal's C++
+  signature is fixed by its invocation sites and compatibility parity —
+  so checked arithmetic inside a literal keeps the compatibility terminal
+  helper spelling (`::gti_internal::backend::add` and family), which
+  contains the defined failure itself; the lambda's MIR failure edges and
+  the invocation's `Invoke` else-edge are therefore unreachable in text
+  and spell as aborts and plain gotos. The `Closure` capability row names
+  the representation `cpp_inline_lambda_v1`, the `CallableDispatch` row
+  names the deduction-based callable surface `cpp_deduced_callable_v1`,
+  and each lambda instance carries a never-called body row so a `Closure`
+  site can prove its exact target; owned or lambda-typed captures and
+  every unfused callable shape decline fail-closed to compatibility
+  emission. Deduced-callable templates emit once per declaration: every
+  monomorphized instance proves the same plain-shape text under an
+  overlay type row spelling its concrete callable type as the
+  declaration's template parameter name (Lambda-kind types are otherwise
+  row-free by design), the per-instance banner lines are the only
+  permitted divergence, and the emitted definition keeps the compat
+  template header and return type with MIR argument naming while carrying
+  one banner per covered instance. A deduced-callable callee keeps the
+  plain terminally-contained convention on every route — it is never
+  transformed, the failure form calls it plainly under an unconditional
+  invoke edge, and it never gates its caller's transformed admission —
+  while a fused closure literal spells inline as the deduction call's
+  callable argument and a template body passes its own callable parameter
+  place by value. Class-callable dispatch and owned callable transport
+  stay outside the vocabulary. Loan-returning bodies join the transformed
+  convention under ADR 018 §5: the failure form takes a `T **`
+  out-parameter (const per the loan's access), the Return-with-loan
+  publishes the pointer and returns true, the boundary wrapper
+  dereferences on success, and a caller pairs the callee's out-argument
+  directly with its own produced call-result loan pointer. A call-result
+  loan from a discharged prefix-storage read binds its element address at
+  the producing call itself when no Borrow claims it, and reference-typed
+  values never declare locals — the loan pointer carries the referent
+  everywhere.
 - `scalar-failure-callgraph-v1` admits one unique no-argument `int32_t` hosted
   entry and its exact closed, acyclic graph of source-defined GTI free
   functions with `int32_t` parameters/results. The body domain reuses the
