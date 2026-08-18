@@ -82,7 +82,17 @@ private:
     missingTokenError = false;
   }
 
+  // Both statement funnels stamp the parser-recorded full extent onto the
+  // returned node so tooling can consume enclosing declaration ranges
+  // without re-deriving structure from punctuation.
   StmtPtr declaration() {
+    const Token start = peek();
+    StmtPtr result = declarationWithoutExtent();
+    stampExtent(result, start);
+    return result;
+  }
+
+  StmtPtr declarationWithoutExtent() {
     if (match({TokenKind::HASH_IF})) {
       return conditionalCompilation(ItemContext::Declaration);
     }
@@ -1044,8 +1054,30 @@ private:
   }
 
   StmtPtr item(ItemContext context) {
+    const Token start = peek();
+    StmtPtr result = itemWithoutExtent(context);
+    stampExtent(result, start);
+    return result;
+  }
+
+  void stampExtent(const StmtPtr &statement, const Token &start) const {
+    if (statement == nullptr || current == 0) {
+      return;
+    }
+    const Token &last = previous();
+    const std::size_t end = last.position + last.lexeme.size();
+    if (end <= start.position) {
+      return;
+    }
+    statement->setExtent(SourceSpan{.source = start.source,
+                                    .start = start.position,
+                                    .end = end,
+                                    .line = start.line});
+  }
+
+  StmtPtr itemWithoutExtent(ItemContext context) {
     if (context == ItemContext::Declaration) {
-      return declaration();
+      return declarationWithoutExtent();
     }
     if (match({TokenKind::HASH_IF})) {
       return conditionalCompilation(context);
@@ -1759,6 +1791,8 @@ private:
   }
 
   ExprPtr finishCall(ExprPtr callee, std::vector<TypeRef> typeArguments) {
+    Token leftParen = previous();
+    std::vector<Token> argumentCommas;
     ExprList arguments;
     if (!check(TokenKind::RIGHT_PAREN)) {
       do {
@@ -1782,13 +1816,19 @@ private:
           break;
         }
         arguments.emplace_back(std::move(argument));
+        if (check(TokenKind::COMMA)) {
+          argumentCommas.push_back(peek());
+        }
       } while (match({TokenKind::COMMA}));
     }
 
     Token paren =
         consume(TokenKind::RIGHT_PAREN, "Expect ')' after arguments.");
-    return std::make_unique<Call>(std::move(callee), std::move(typeArguments),
-                                  paren, std::move(arguments));
+    auto call =
+        std::make_unique<Call>(std::move(callee), std::move(typeArguments),
+                               paren, std::move(arguments));
+    call->setArgumentGeometry(std::move(leftParen), std::move(argumentCommas));
+    return call;
   }
 
   std::vector<TypeRef> typeArgumentList() {

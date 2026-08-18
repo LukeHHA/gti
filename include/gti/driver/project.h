@@ -145,6 +145,17 @@ struct ProjectTestResolutionResult {
   }
 };
 
+struct ProjectTargetSetResolutionResult {
+  ProjectResolutionStatus status = ProjectResolutionStatus::DiscoveryFailure;
+  std::vector<ProjectBuildPlan> plans;
+  SourceManager sources;
+  std::vector<Diagnostic> diagnostics;
+
+  [[nodiscard]] bool succeeded() const {
+    return status == ProjectResolutionStatus::Success && !plans.empty();
+  }
+};
+
 enum class ProjectMetadataStatus {
   Success,
   DiscoveryFailure,
@@ -247,6 +258,12 @@ resolveProjectBuild(const ProjectBuildRequest &request);
 
 [[nodiscard]] ProjectTestResolutionResult
 resolveProjectTests(const ProjectBuildRequest &request);
+
+// Resolves one build plan for every declared executable and test target of
+// the selected package, in the manifest's deterministic target-name order.
+// The request must not name a single target.
+[[nodiscard]] ProjectTargetSetResolutionResult
+resolveAllProjectTargets(const ProjectBuildRequest &request);
 
 [[nodiscard]] ProjectMetadataResult
 resolveProjectMetadata(const std::filesystem::path &startDirectory,

@@ -885,6 +885,12 @@ struct LambdaInfo {
   SemanticTypeTraits traits{};
 };
 
+struct LambdaCaptureLink {
+  SymbolId source = 0;
+  SymbolId binding = 0;
+  LambdaCaptureMode mode = LambdaCaptureMode::Copy;
+};
+
 struct ClassFieldTypeInfo {
   const VariableDecl *declaration = nullptr;
   SemanticType type = SemanticType::Unknown;
@@ -1361,6 +1367,16 @@ struct SymbolRecord {
   bool compilerPrivate = false;
 };
 
+// Byte-exact source geometry of one call's argument list, recorded by the
+// semantic analyzer from parser tokens so editor signature help never has to
+// re-parse punctuation: the delimiters are the '(' and ')' offsets and each
+// separator is one argument-separating ',' offset.
+struct SemanticCallGeometry {
+  std::size_t leftDelimiter = 0;
+  std::size_t rightDelimiter = 0;
+  std::vector<std::size_t> argumentSeparators;
+};
+
 struct SemanticOccurrence {
   SourceUnitId sourceUnit = 0;
   SourceSpan span;
@@ -1381,6 +1397,7 @@ struct SemanticOccurrence {
   const DestructorDecl *destructor = nullptr;
   std::optional<ResolvedCallInfo> selectedCall;
   std::optional<ResolvedConstructionInfo> selectedConstruction;
+  std::optional<SemanticCallGeometry> callGeometry;
   bool staticMember = false;
 };
 
@@ -1675,6 +1692,12 @@ public:
   [[nodiscard]] const LambdaInfo *findLambda(const Lambda &declaration) const;
 
   [[nodiscard]] const LambdaInfo *findLambda(LambdaId id) const;
+
+  // Every recorded lambda-capture pairing of enclosing source binding and
+  // capture target, including base-model records. Copy-snapshot captures
+  // couple the two names syntactically, so tooling that rewrites one symbol
+  // must consult these links instead of matching spellings.
+  [[nodiscard]] std::vector<LambdaCaptureLink> lambdaCaptureLinks() const;
 
   [[nodiscard]] const ClassTypeInfo *
   findClassType(const ClassDecl &declaration) const;
