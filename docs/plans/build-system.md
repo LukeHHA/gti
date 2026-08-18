@@ -124,6 +124,20 @@ compiled with a separately resolved C compiler; declared `.cpp`, `.cc`, and
 become managed link objects. Structured paths are validated within the package;
 exact argument arrays use the documented trusted escape-hatch policy. Eligible
 project build/run/test requests use the whole-program cache unless `--no-cache`
+is selected; declared native sources, native search directories, opaque native
+argument vectors, native link operands, and name-resolved
+libraries/frameworks bypass it.
+
+Pinned git dependencies are implemented:
+`alias = { git = "<url>", rev = "<full 40-hex commit>" }` is the only accepted
+git form, `gti fetch` is the sole writer of the workspace `gti.lock`
+(lock-version 1, sorted entries with `sha256:` tree checksums and dependency
+edges), and build/check/run/test verify lock coverage plus stored-tree
+checksums and locked package identity before source loading. `--offline` and
+`--locked` refuse acquisition; a plain build may materialize a lock-covered
+missing checkout. Branch/tag selectors and registry ranges remain rejected.
+Package-level native inputs on a dependency are rejected until native
+dependency composition is defined.
 is selected; declared native sources, include directories, and
 content-complete exact link files join cache identity through native
 dependency discovery, while opaque native argument vectors, native search
@@ -469,12 +483,12 @@ contained existing `[package].source-root`; omission means `src`. Workspace
 roots use `[workspace].members = ["packages/a", "packages/b"]`; members are
 canonical contained directories and cannot declare nested workspaces.
 
-Exact Git syntax is deliberately not accepted yet. Its next phase will use a
-full immutable revision and lock entry rather than an unlocked branch:
+Pinned git dependencies are accepted with a full immutable revision; branch
+and tag selectors are rejected so a build plan can never depend on mutable
+remote state:
 
 ```toml
-# planned, not implemented
-math = { git = "https://example.invalid/math.git", rev = "<full commit>" }
+math = { git = "https://example.invalid/math.git", rev = "<full 40-hex commit>" }
 ```
 
 Registry ranges should wait until package identity, lockfile behavior,
@@ -534,6 +548,9 @@ gti build chip8 --release
 gti build chip8 --verbose
 gti build chip8 --no-cache
 gti build --all --jobs 4
+gti fetch
+gti build --locked
+gti build --offline
 gti check chip8
 gti check chip8 --release
 gti run chip8
@@ -919,7 +936,9 @@ transitive source declarations do not leak.
 
 ### Stage 3: Git dependencies and lockfile
 
-Resolve only pinned tags or revisions into an immutable lock entry containing:
+Status: complete for pinned full revisions (see Milestone 7).
+
+Resolve only pinned revisions into an immutable lock entry containing:
 
 - source URL;
 - requested selector;
@@ -1096,7 +1115,7 @@ Status: complete
 - Compile each selected source to an atomically published managed intermediate
   object, then place C objects followed by C++ objects before runtime and
   manifest libraries in the existing final C++ link.
-- Report the resolved C and C++ inputs through metadata schema version 7 while
+- Report the resolved C and C++ inputs through metadata schema version 8 while
   keeping `check` compiler-free and output-free.
 
 Acceptance criteria:
@@ -1243,17 +1262,34 @@ Acceptance criteria:
 
 ### Milestone 7: Git resolution and lockfile
 
-- Add fetch/cache storage, exact revision resolution, and `gti.lock`.
-- Add `gti fetch`, `--locked`, and `--offline`.
-- Make the main package the only authority for replacements.
-- Define lockfile merge and update commands before automatic edits.
+Status: complete for pinned full revisions; registry ranges and any mutable
+selector (branch/tag) remain out of scope by design.
+
+- **Complete:** fetch/cache storage under `build/gti/deps/git` (bare object
+  databases keyed by URL identity, blob-extracted checkouts keyed by URL and
+  revision), exact revision resolution, and `gti.lock`.
+- **Complete:** `gti fetch [--offline]`, and `--locked`/`--offline` on
+  build, check, run, and test.
+- **Complete:** lock updates are never automatic — `gti fetch` is the lock's
+  only writer, and it re-derives every checksum from the immutable object
+  database so a locally modified checkout cannot launder content into a
+  fresh lock. Builds only consume the lock.
+- Replacement/override authority beyond the manifest's own pins waits for a
+  demonstrated need.
 
 Acceptance criteria:
 
-- locked offline builds are repeatable from a populated source cache;
-- a changed upstream branch cannot alter a locked build;
-- checksums and manifest identities are verified before source loading;
-- dependency acquisition never executes package code.
+- **Passed:** locked offline builds are repeatable from a populated source
+  cache (`gti fetch` then `gti build --offline`);
+- **Passed:** a changed upstream branch cannot alter a locked build — only a
+  manifest re-pin plus an explicit `gti fetch` moves the closure;
+- **Passed:** checksums and locked package identities are verified before
+  source loading, and mismatches refuse the build with focused `GTI-B17xx`
+  diagnostics;
+- **Passed:** dependency acquisition never executes package code — trees are
+  extracted blob-by-blob from a bare database (no checkout, hooks, filters,
+  or submodules), and symbolic links, gitlinks, unsafe paths, and
+  case-folded collisions reject the tree.
 
 ## Testing Strategy
 

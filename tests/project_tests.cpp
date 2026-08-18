@@ -1,3 +1,4 @@
+#include "gti/driver/dependencies.h"
 #include "gti/driver/manifest.h"
 #include "gti/driver/project.h"
 #include "gti/format_config.h"
@@ -1575,128 +1576,156 @@ void testFormatConfigScaffolding() {
 
 } // namespace
 
-void testNativeDependencyComposition() {
+void testDependencyLockModel() {
+  using lang::driver::DependencyLock;
+  using lang::driver::LockedGitPackage;
+
+  expect(lang::driver::isFullGitRevision(
+             "0123456789abcdef0123456789abcdef01234567") &&
+             !lang::driver::isFullGitRevision("0123456789abcdef") &&
+             !lang::driver::isFullGitRevision(
+                 "0123456789ABCDEF0123456789abcdef01234567") &&
+             !lang::driver::isFullGitRevision(
+                 "0123456789abcdef0123456789abcdef0123456z"),
+         "full git revisions are exactly 40 lowercase hex characters");
+
+  const std::string checksum = "sha256:" + std::string(64, 'a');
+  DependencyLock lock;
+  lock.packages.push_back(
+      {.name = "zeta",
+       .version = "0.2.0",
+       .url = "https://example.invalid/zeta.git",
+       .revision = "0123456789abcdef0123456789abcdef01234567",
+       .checksum = checksum,
+       .dependencies = {"beta", "alpha"}});
+  lock.packages.push_back(
+      {.name = "alpha",
+       .version = "1.0.0",
+       .url = "https://example.invalid/alpha.git",
+       .revision = "fedcba9876543210fedcba9876543210fedcba98",
+       .checksum = checksum,
+       .dependencies = {}});
+  const std::string rendered = lang::driver::renderDependencyLock(lock);
+  expect(rendered.find("name = \"alpha\"") < rendered.find("name = \"zeta\"") &&
+             rendered.find("[\"alpha\", \"beta\"]") != std::string::npos,
+         "the lock emitter sorts packages and dependency names "
+         "deterministically");
+  expect(rendered == lang::driver::renderDependencyLock(lock),
+         "lock rendering is deterministic");
+
   TemporaryDirectory temporary;
-  const std::filesystem::path appRoot = temporary.root() / "app";
-  const std::filesystem::path wrapperRoot = temporary.root() / "wrapper";
-  const std::filesystem::path baseRoot = temporary.root() / "base";
+  std::string writeError;
+  expect(lang::driver::writeDependencyLock(temporary.root(), lock, writeError),
+         "the lock should write atomically: " + writeError);
+  const lang::driver::DependencyLockLoadResult loaded =
+      lang::driver::loadDependencyLock(temporary.root());
+  expect(loaded.succeeded() && loaded.lock.packages.size() == 2 &&
+             loaded.lock.packages[0].name == "alpha" &&
+             loaded.lock.packages[1].name == "zeta" &&
+             loaded.lock.packages[1].dependencies ==
+                 std::vector<std::string>({"alpha", "beta"}) &&
+             lang::driver::renderDependencyLock(loaded.lock) == rendered,
+         "a written lock should load back to an identical closure");
+  const lang::driver::LockedGitPackage *found = loaded.lock.find(
+      {.url = "https://example.invalid/zeta.git",
+       .revision = "0123456789abcdef0123456789abcdef01234567"});
+  expect(found != nullptr && found->name == "zeta",
+         "lock lookup resolves by exact URL and revision");
 
-  writeFile(appRoot / "src/main.gti", "int main() { return 0; }\n");
-  writeFile(wrapperRoot / "src/wrap.gti", "\n");
-  writeFile(wrapperRoot / "native/include/wrap.h", "\n");
-  writeFile(wrapperRoot / "native/impl.c", "int impl(void) { return 0; }\n");
-  writeFile(baseRoot / "src/decl.gti", "\n");
-  writeFile(baseRoot / "native/base.c", "int base(void) { return 0; }\n");
-  writeFile(baseRoot / "gti.toml", "manifest-version = 1\n\n[package]\n"
-                                   "name = \"base\"\nversion = \"0.1.0\"\n\n"
-                                   "[package.native]\n"
-                                   "c-sources = [\"native/base.c\"]\n");
+  expect(
+      lang::driver::loadDependencyLock(temporary.root() / "missing").status ==
+          lang::driver::DependencyLockLoadStatus::Missing,
+      "a missing lock reports Missing rather than an error");
 
-  const auto writeWrapper = [&](std::string_view nativeLines) {
-    writeFile(wrapperRoot / "gti.toml",
-              "manifest-version = 1\n\n[package]\nname = \"wrapper\"\n"
-              "version = \"0.1.0\"\n\n[package.native]\n" +
-                  std::string(nativeLines) +
-                  "\n[dependencies]\nbase = { path = \"../base\" }\n");
+  const auto rejects = [&](std::string_view text, std::string_view why) {
+    writeFile(temporary.root() / "gti.lock", text);
+    const lang::driver::DependencyLockLoadResult result =
+        lang::driver::loadDependencyLock(temporary.root());
+    expect(result.status ==
+                   lang::driver::DependencyLockLoadStatus::ParseFailure &&
+               !result.diagnostics.empty() &&
+               result.diagnostics.front().code == "GTI-B1702",
+           std::string(why));
   };
-  const auto writeApp = [&] {
-    writeFile(appRoot / "gti.toml",
-              "manifest-version = 1\n\n[package]\nname = \"app\"\n"
-              "version = \"0.1.0\"\n\n[dependencies]\n"
-              "wrap = { path = \"../wrapper\" }\n\n[targets.app]\n"
-              "kind = \"executable\"\nroot = \"src/main.gti\"\n");
-  };
-  writeApp();
-  const auto resolve = [&] {
-    return lang::driver::resolveProjectBuild(lang::driver::ProjectBuildRequest(
-        appRoot, std::nullopt, "dev",
-        lang::TargetInfo{.os = "macos", .vendor = "apple", .arch = "arm64"}));
-  };
+  rejects("lock-version = 2\n", "an unsupported lock version is rejected");
+  rejects("lock-version = 1\nmystery = true\n",
+          "unknown lock fields are rejected");
+  rejects("lock-version = 1\n[[package]]\nname = \"a\"\nversion = \"1\"\n"
+          "source = \"git+u\"\nrev = \"abc\"\nchecksum = \"sha256:" +
+              std::string(64, 'a') + "\"\n",
+          "a short revision is rejected");
+  rejects("lock-version = 1\n[[package]]\nname = \"a\"\nversion = \"1\"\n"
+          "source = \"https://u\"\nrev = \"" +
+              std::string(40, 'a') +
+              "\"\nchecksum = \"sha256:" + std::string(64, 'a') + "\"\n",
+          "a non-git source is rejected");
+  rejects("lock-version = 1\n[[package]]\nname = \"a\"\nversion = \"1\"\n"
+          "source = \"git+u\"\nrev = \"" +
+              std::string(40, 'a') + "\"\nchecksum = \"bad\"\n",
+          "a malformed checksum is rejected");
+  const std::string entry =
+      "[[package]]\nname = \"a\"\nversion = \"1\"\nsource = \"git+u\"\n"
+      "rev = \"" +
+      std::string(40, 'a') + "\"\nchecksum = \"sha256:" + std::string(64, 'a') +
+      "\"\n";
+  rejects("lock-version = 1\n" + entry + entry,
+          "duplicate package names are rejected");
+  rejects("not toml at all [", "invalid TOML is rejected with GTI-B1702");
+}
 
-  writeWrapper("include-dirs = [\"native/include\"]\n"
-               "c-sources = [\"native/impl.c\"]\n"
-               "c-standard = \"c23\"\n"
-               "c-compile-args = [\"-DWRAP_BIAS=7\", \"-UNDEBUG\"]\n"
-               "libraries = [\"m\"]\n\n"
-               "[[package.native.platforms]]\n"
-               "os = \"linux\"\n"
-               "raw-args = [\"--unselected-platform\"]\n");
-  const lang::driver::ProjectResolutionResult composed = resolve();
-  expect(composed.succeeded(), "structured dependency native inputs compose");
-  if (composed.succeeded()) {
-    const lang::driver::NativeInputs &inputs = composed.plan->nativeInputs();
-    expect(inputs.dependencyGroups.size() == 2 &&
-               inputs.dependencyGroups[0].packageIdentity == "wrapper@0.1.0" &&
-               inputs.dependencyGroups[1].packageIdentity == "base@0.1.0",
-           "composition orders dependents before their dependencies");
-    const lang::driver::NativeDependencyGroup &wrapper =
-        inputs.dependencyGroups[0];
-    expect(wrapper.includeDirectories.size() == 1 &&
-               wrapper.cSources.size() == 1 &&
-               wrapper.cStandard == lang::driver::CStandard::C23 &&
-               wrapper.cMacroDefinitions ==
-                   std::vector<std::string>({"-DWRAP_BIAS=7", "-UNDEBUG"}) &&
-               wrapper.linkOperands.size() == 1 &&
-               wrapper.linkOperands[0].kind ==
-                   lang::driver::NativeLinkOperandKind::Library &&
-               wrapper.linkOperands[0].value == "m",
-           "a composed group carries the dependency's selected structured "
-           "inputs and validated macros");
-    expect(inputs.includeDirectories.empty() && inputs.cSources.empty() &&
-               inputs.orderedLinkOperands.empty(),
-           "dependency native inputs stay scoped to their group and never "
-           "merge into the application's own inputs");
-    const lang::driver::NativeDependencyGroup &base =
-        inputs.dependencyGroups[1];
-    expect(base.cSources.size() == 1 &&
-               base.cStandard == lang::driver::CStandard::C17,
-           "a transitive dependency composes its own group with the default "
-           "C standard");
-  }
-
-  const auto rejects = [&](std::string_view nativeLines,
-                           std::string_view needle, std::string_view why) {
-    writeWrapper(nativeLines);
-    const lang::driver::ProjectResolutionResult result = resolve();
+void testGitDependencyManifestValidation() {
+  TemporaryDirectory temporary;
+  const std::filesystem::path manifest = temporary.root() / "gti.toml";
+  const auto load = [&](std::string_view dependency) {
+    writeFile(manifest, "manifest-version = 1\n\n[package]\nname = \"app\"\n"
+                        "version = \"0.1.0\"\n\n[dependencies]\n" +
+                            std::string(dependency) +
+                            "\n\n[targets.app]\nkind = \"executable\"\n"
+                            "root = \"src/main.gti\"\n");
+    writeFile(temporary.root() / "src/main.gti", "int main() { return 0; }\n");
+    return lang::driver::loadProjectManifest(manifest);
+  };
+  const auto failsWith = [&](std::string_view dependency, std::string_view code,
+                             std::string_view why) {
+    const lang::driver::ManifestLoadResult result = load(dependency);
     const bool matched =
         !result.succeeded() &&
         std::any_of(result.diagnostics.begin(), result.diagnostics.end(),
                     [&](const lang::Diagnostic &diagnostic) {
-                      return diagnostic.code == "GTI-B1606" &&
-                             diagnostic.message.find(needle) !=
-                                 std::string::npos;
+                      return diagnostic.code == code;
                     });
     expect(matched, std::string(why));
   };
-  rejects("c-sources = [\"native/impl.c\"]\nlink-args = [\"-Wl,-S\"]\n",
-          "linker or raw argument", "dependency link arguments never compose");
-  rejects("c-sources = [\"native/impl.c\"]\nraw-args = [\"-fanything\"]\n",
-          "linker or raw argument", "dependency raw arguments never compose");
-  rejects("c-sources = [\"native/impl.c\"]\n"
-          "c-compile-args = [\"-include\", \"evil.h\"]\n",
-          "'-include'", "a non-macro dependency compiler argument is refused");
-  rejects("cpp-sources = []\ncompile-args = [\"-fno-builtin\"]\n",
-          "'-fno-builtin'",
-          "non-macro compiler arguments from a dependency are refused");
-  rejects("c-sources = [\"native/impl.c\"]\n"
-          "c-compile-args = [\"-D1BAD=2\"]\n",
-          "'-D1BAD=2'", "an invalid macro name is refused");
 
-  // A dependency's target-scoped native table is not part of package-level
-  // composition; only [package.native] contributes.
-  writeFile(wrapperRoot / "gti.toml",
-            "manifest-version = 1\n\n[package]\nname = \"wrapper\"\n"
-            "version = \"0.1.0\"\n\n[targets.tool]\n"
-            "kind = \"executable\"\nroot = \"src/wrap.gti\"\n\n"
-            "[targets.tool.native]\nc-sources = [\"native/impl.c\"]\n\n"
-            "[dependencies]\nbase = { path = \"../base\" }\n");
-  const lang::driver::ProjectResolutionResult targetScoped = resolve();
-  expect(targetScoped.succeeded() &&
-             targetScoped.plan->nativeInputs().dependencyGroups.size() == 1 &&
-             targetScoped.plan->nativeInputs()
-                     .dependencyGroups[0]
-                     .packageIdentity == "base@0.1.0",
-         "a dependency's target-scoped native table does not compose");
+  const std::string revision(40, 'a');
+  failsWith("dep = { git = \"https://example.invalid/dep.git\" }", "GTI-B1006",
+            "a git dependency without rev is rejected");
+  failsWith("dep = { git = \"https://example.invalid/dep.git\", rev = "
+            "\"abc\" }",
+            "GTI-B1006", "a short rev is rejected");
+  failsWith("dep = { path = \"../dep\", git = \"https://example.invalid\", "
+            "rev = \"" +
+                revision + "\" }",
+            "GTI-B1006", "path and git together are rejected");
+  failsWith("dep = { rev = \"" + revision + "\" }", "GTI-B1006",
+            "rev without git is rejected");
+  failsWith("dep = { git = \"https://example.invalid/with space\", rev = \"" +
+                revision + "\" }",
+            "GTI-B1006", "whitespace in a git URL is rejected");
+  failsWith("dep = { git = \"https://example.invalid/dep.git\", rev = \"" +
+                revision + "\", branch = \"main\" }",
+            "GTI-B1001", "branch selectors are rejected as unknown fields");
+
+  const lang::driver::ManifestLoadResult valid =
+      load("dep = { git = \"https://example.invalid/dep.git\", rev = \"" +
+           std::string(40, 'A') + "\" }");
+  expect(valid.succeeded() && valid.manifest->dependencies().size() == 1 &&
+             valid.manifest->dependencies().front().git.has_value() &&
+             valid.manifest->dependencies().front().git->revision ==
+                 std::string(40, 'a') &&
+             valid.manifest->dependencies().front().packageRoot.empty(),
+         "a valid git dependency parses with a lowercase-normalized revision "
+         "and no resolved package root");
 }
 
 int main() {
@@ -1709,7 +1738,8 @@ int main() {
   testNativeManifestDiagnostics();
   testCleanSafety();
   testWorkspaceAndPathDependencies();
-  testNativeDependencyComposition();
+  testDependencyLockModel();
+  testGitDependencyManifestValidation();
   testProjectScaffolding();
   testFormatConfigScaffolding();
 
